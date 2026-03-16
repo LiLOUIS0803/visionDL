@@ -3,7 +3,6 @@ import copy
 import time
 import argparse
 from pathlib import Path
-from xml.parsers.expat import model
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -11,6 +10,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
@@ -37,6 +37,74 @@ class TestDataset(Dataset):
             image = self.transform(image)
 
         return image, img_name
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(
+            logits,
+            targets,
+            reduction="none",
+            weight=self.alpha
+        )
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+    
+class ResNet50MultiScale(nn.Module):
+    def __init__(self, num_classes, dropout=0.3):
+        super().__init__()
+
+        weights = ResNet50_Weights.IMAGENET1K_V2
+        backbone = resnet50(weights=weights)
+
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool
+        )
+
+        self.layer1 = backbone.layer1   # 256
+        self.layer2 = backbone.layer2   # 512
+        self.layer3 = backbone.layer3   # 1024
+        self.layer4 = backbone.layer4   # 2048
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        fusion_dim = 512 + 1024 + 2048
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(1024, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+
+        f2 = self.layer2(x)   # [B, 512, H/8, W/8]
+        f3 = self.layer3(f2)  # [B, 1024, H/16, W/16]
+        f4 = self.layer4(f3)  # [B, 2048, H/32, W/32]
+
+        p2 = self.pool(f2).flatten(1)
+        p3 = self.pool(f3).flatten(1)
+        p4 = self.pool(f4).flatten(1)
+
+        fused = torch.cat([p2, p3, p4], dim=1)
+        out = self.classifier(fused)
+        return out
 
 def fix_class_to_idx(dataset):
     old_classes = dataset.classes[:]   # 原本字串排序
@@ -64,23 +132,24 @@ def get_dataloaders(data_root, batch_size=32, num_workers=4, train=True):
     imagenet_mean = [0.485, 0.456, 0.406]
     imagenet_std = [0.229, 0.224, 0.225]
 
-    image_size = 320
+    image_size = 384
 
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(
             image_size,
-            scale=(0.6, 1.0),
-            ratio=(0.75, 1.3333)
+            scale=(0.8, 1.0),
+            ratio=(0.9, 1.1)
         ),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
+        # transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.08, hue=0.02),
+        transforms.RandAugment(num_ops=2, magnitude=7),
         transforms.ToTensor(),
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.12), ratio=(0.3, 3.3), value="random"),
+        
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize(360),
+        transforms.Resize(448),
         transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
@@ -111,16 +180,18 @@ def build_model(num_classes, device):
     # 載入 ImageNet V2 預訓練權重
     
     # ResNet-50 0.92
-    weights = ResNet50_Weights.IMAGENET1K_V2
-    model = resnet50(weights=weights)
+    # weights = ResNet50_Weights.IMAGENET1K_V2
+    # model = resnet50(weights=weights)
     
-    # ResNet-152
-    # weights = ResNet152_Weights.IMAGENET1K_V2
-    # model = resnet152(weights=weights)
+    # # ResNet-152
+    # # weights = ResNet152_Weights.IMAGENET1K_V2
+    # # model = resnet152(weights=weights)
 
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
+    # in_features = model.fc.in_features
+    # model.fc = nn.Linear(in_features, num_classes)
 
+    model = ResNet50MultiScale(num_classes=num_classes, dropout=0.3)
+    
     return model.to(device)
 
 
@@ -231,7 +302,46 @@ def evaluate(model, loader, criterion, device, class_names=None, save_cm_path=No
 
     return epoch_loss, epoch_acc
 
-def inference(data_root, checkpoint='best.pth', device=None):
+def tta_inference(model, images, device, num_crops=3):
+    """
+    images: 已經過 val_test_transform 的 tensor [B, C, H, W]
+    回傳平均後的機率分布
+    """
+    import torchvision.transforms.functional as TF
+
+    all_probs = []
+
+    # 1. 原圖
+    with torch.no_grad():
+        logits = model(images.to(device))
+        all_probs.append(torch.softmax(logits, dim=1))
+
+    # 2. 水平翻轉
+    with torch.no_grad():
+        flipped = torch.flip(images, dims=[3])  # W 軸翻轉
+        logits = model(flipped.to(device))
+        all_probs.append(torch.softmax(logits, dim=1))
+
+    # 3. 稍微縮小的 crop（模擬不同尺度）
+    with torch.no_grad():
+        # 從中心裁出較小區域再 resize 回去
+        _, _, H, W = images.shape
+        crop_size = int(H * 0.9)
+        top = (H - crop_size) // 2
+        left = (W - crop_size) // 2
+        cropped = images[:, :, top:top+crop_size, left:left+crop_size]
+        cropped = torch.nn.functional.interpolate(
+            cropped, size=(H, W), mode='bilinear', align_corners=False
+        )
+        logits = model(cropped.to(device))
+        all_probs.append(torch.softmax(logits, dim=1))
+
+    # 平均所有機率
+    avg_probs = torch.stack(all_probs, dim=0).mean(dim=0)
+    return avg_probs
+
+
+def inference(data_root, checkpoint='best.pth', device=None, use_tta=True):
     data_root = Path(data_root)
     test_loader, class_names = get_dataloaders(data_root=data_root, train=False)
     
@@ -243,16 +353,20 @@ def inference(data_root, checkpoint='best.pth', device=None):
     model.eval()
     results = []
 
-    with torch.no_grad():
-        for images, names in test_loader:
-            images = images.to(device, non_blocking=True)
-            outputs = model(images)
-            preds = outputs.argmax(dim=1)
+    for images, names in tqdm(test_loader, desc="Inference"):
+        if use_tta:
+            avg_probs = tta_inference(model, images, device)
+            preds = avg_probs.argmax(dim=1)
+        else:
+            with torch.no_grad():
+                images = images.to(device, non_blocking=True)
+                outputs = model(images)
+                preds = outputs.argmax(dim=1)
 
-            for name, pred in zip(names, preds):
-                image_name = Path(name).stem
-                pred_label = class_names[pred.item()]
-                results.append((image_name, pred_label))
+        for name, pred in zip(names, preds):
+            image_name = Path(name).stem
+            pred_label = class_names[pred.item()]
+            results.append((image_name, pred_label))
 
     df = pd.DataFrame(results, columns=["image_name", "pred_label"])
     df.to_csv("prediction.csv", index=False)
@@ -279,25 +393,34 @@ def train_model(
     print(f"Number of classes: {num_classes}")
     
     model = build_model(num_classes=num_classes, device=device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    criterion = FocalLoss(gamma=2.0)
+    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.AdamW([
+        {"params": model.classifier.parameters(), "lr": lr},
+        {"params": model.layer4.parameters(), "lr": lr * 0.3},
+        {"params": model.layer3.parameters(), "lr": lr * 0.2},
+        {"params": model.layer2.parameters(), "lr": lr * 0.1},
+        {"params": model.layer1.parameters(), "lr": lr * 0.05},
+        {"params": model.stem.parameters(), "lr": lr * 0.05},
+    ], weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     best_val_acc = 0.0
     best_model_wts = copy.deepcopy(model.state_dict())
 
-    for param in model.parameters():
-        param.requires_grad = False
+    # for param in model.parameters():
+    #     param.requires_grad = False
 
-    for param in model.fc.parameters():
-        param.requires_grad = True
+    # for param in model.classifier.parameters():
+    #     param.requires_grad = True
     
     for epoch in range(epochs):
         start_time = time.time()
 
-        if epoch == freeze_epochs:  
-            for param in model.parameters():
-                param.requires_grad = True
+        # if epoch == freeze_epochs:  
+        #     for param in model.parameters():
+        #         param.requires_grad = True
         
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
@@ -355,15 +478,16 @@ if __name__ == "__main__":
     argparser.add_argument("--data_root", type=str, default=DATA_ROOT, help="Path to dataset root")
     argparser.add_argument("--save_path", type=str, default=SAVE_PATH, help="Path to save the best model checkpoint")
     argparser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    argparser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and validation")
+    argparser.add_argument("--batch_size", type=int, default=16, help="Batch size for training and validation")
     argparser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     argparser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
-    argparser.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing factor")
+    argparser.add_argument("--label_smoothing", type=float, default=0.05, help="Label smoothing factor")
     argparser.add_argument("--num_workers", type=int, default=4, help="Number of workers for data loading")
     argparser.add_argument("--train", action="store_true", help="Whether to train the model")
     argparser.add_argument("--inference", action="store_true", help="Whether to run inference after training")
     argparser.add_argument("--freeze_epochs", type=int, default=5, help="Number of epochs to freeze backbone during training")
     argparser.add_argument("--eval_cm", action="store_true", help="Evaluate checkpoint and save confusion matrix")
+    argparser.add_argument("--use_tta", action="store_true", help="Whether to use Test Time Augmentation during inference")
     args = argparser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -384,7 +508,7 @@ if __name__ == "__main__":
         )
 
     if args.inference:
-        inference(data_root=args.data_root, checkpoint=args.save_path, device=device)
+        inference(data_root=args.data_root, checkpoint=args.save_path, device=device, use_tta=args.use_tta)
         
     if args.eval_cm:
         evaluate_checkpoint(
