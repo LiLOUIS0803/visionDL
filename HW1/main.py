@@ -1,26 +1,33 @@
-import os
-import csv
 import argparse
+import csv
+import os
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+IMAGE_SIZE = 480
 
 
 # ============================================================
 # Dataset
 # ============================================================
 class TestDataset(Dataset):
+    """Dataset for unlabeled test images."""
+
     def __init__(self, root, transform=None):
         self.root = root
         self.transform = transform
@@ -39,9 +46,12 @@ class TestDataset(Dataset):
 
 
 def fix_class_to_idx(dataset):
+    """Sort class names numerically and rebuild class indices."""
     old_classes = dataset.classes[:]
     sorted_classes = sorted(old_classes, key=lambda x: int(x))
-    new_class_to_idx = {cls: idx for idx, cls in enumerate(sorted_classes)}
+    new_class_to_idx = {
+        cls_name: idx for idx, cls_name in enumerate(sorted_classes)
+    }
 
     new_samples = []
     for path, old_idx in dataset.samples:
@@ -52,45 +62,62 @@ def fix_class_to_idx(dataset):
     dataset.classes = sorted_classes
     dataset.class_to_idx = new_class_to_idx
     dataset.samples = new_samples
-    dataset.targets = [s[1] for s in new_samples]
+    dataset.targets = [sample[1] for sample in new_samples]
+
+
+def build_train_transform():
+    """Build training data augmentation pipeline."""
+    return transforms.Compose(
+        [
+            transforms.RandomResizedCrop(
+                IMAGE_SIZE,
+                scale=(0.5, 1.0),
+                ratio=(0.75, 1.3333),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=9),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            transforms.RandomErasing(
+                p=0.3,
+                scale=(0.02, 0.15),
+                value="random",
+            ),
+        ]
+    )
+
+
+def build_eval_transform(resize_ratio=1.05):
+    """Build validation / test transform pipeline."""
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                int(IMAGE_SIZE * resize_ratio),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
 
 
 def get_dataloaders(data_root, batch_size=32, num_workers=4, train=True):
+    """Create dataloaders for training / validation / testing."""
     data_root = Path(data_root)
 
-    imagenet_mean = [0.485, 0.456, 0.406]
-    imagenet_std = [0.229, 0.224, 0.225]
-    image_size = 480
-
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(
-            image_size,
-            scale=(0.5, 1.0),
-            ratio=(0.75, 1.3333),
-            interpolation=transforms.InterpolationMode.BICUBIC,
-        ),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandAugment(num_ops=2, magnitude=9),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), value="random"),
-    ])
-
-    val_test_transform = transforms.Compose([
-        transforms.Resize(int(image_size * 1.05), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-    ])
-
     train_dataset = datasets.ImageFolder(
-        os.path.join(data_root, "train"), transform=train_transform
+        data_root / "train",
+        transform=build_train_transform(),
     )
     val_dataset = datasets.ImageFolder(
-        os.path.join(data_root, "val"), transform=val_test_transform
+        data_root / "val",
+        transform=build_eval_transform(),
     )
     test_dataset = TestDataset(
-        os.path.join(data_root, "test"), transform=val_test_transform
+        data_root / "test",
+        transform=build_eval_transform(),
     )
 
     fix_class_to_idx(train_dataset)
@@ -128,6 +155,8 @@ def get_dataloaders(data_root, batch_size=32, num_workers=4, train=True):
 # CBAM
 # ============================================================
 class ChannelAttention(nn.Module):
+    """Channel attention module."""
+
     def __init__(self, channels, reduction=16):
         super().__init__()
         mid_channels = max(channels // reduction, 1)
@@ -146,9 +175,17 @@ class ChannelAttention(nn.Module):
 
 
 class SpatialAttention(nn.Module):
+    """Spatial attention module."""
+
     def __init__(self, kernel_size=7):
         super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.conv = nn.Conv2d(
+            2,
+            1,
+            kernel_size,
+            padding=kernel_size // 2,
+            bias=False,
+        )
 
     def forward(self, x):
         avg_out = x.mean(dim=1, keepdim=True)
@@ -158,6 +195,8 @@ class SpatialAttention(nn.Module):
 
 
 class CBAM(nn.Module):
+    """Convolutional Block Attention Module."""
+
     def __init__(self, channels, reduction=16, spatial_kernel=7):
         super().__init__()
         self.channel_attn = ChannelAttention(channels, reduction)
@@ -173,21 +212,27 @@ class CBAM(nn.Module):
 # GeM Pooling
 # ============================================================
 class GeM(nn.Module):
+    """Generalized Mean Pooling."""
+
     def __init__(self, p=3.0, eps=1e-6):
         super().__init__()
         self.p = nn.Parameter(torch.ones(1) * p)
         self.eps = eps
 
     def forward(self, x):
-        return F.adaptive_avg_pool2d(
-            x.clamp(min=self.eps).pow(self.p), 1
-        ).pow(1.0 / self.p)
+        pooled = F.adaptive_avg_pool2d(
+            x.clamp(min=self.eps).pow(self.p),
+            1,
+        )
+        return pooled.pow(1.0 / self.p)
 
 
 # ============================================================
-# Model: Multi-Scale CBAM + ResNeXt101
+# Models
 # ============================================================
 class MultiScaleCBAMResNeXt(nn.Module):
+    """Multi-scale CBAM classifier with a ResNeXt backbone."""
+
     def __init__(self, num_classes=100, dropout=0.3):
         super().__init__()
 
@@ -196,7 +241,10 @@ class MultiScaleCBAMResNeXt(nn.Module):
         )
 
         self.stem = nn.Sequential(
-            backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
         )
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
@@ -239,12 +287,15 @@ class MultiScaleCBAMResNeXt(nn.Module):
         return self.head(feat)
 
 
-# ============================================================
-# Model: Multi-Scale CBAM + ResNestRS101
-# ============================================================
-
 class MultiScaleCBAMResNetRS(nn.Module):
-    def __init__(self, num_classes=100, dropout=0.3, model_name="resnetrs101.tf_in1k"):
+    """Multi-scale CBAM classifier with a ResNetRS backbone."""
+
+    def __init__(
+        self,
+        num_classes=100,
+        dropout=0.3,
+        model_name="resnetrs101.tf_in1k",
+    ):
         super().__init__()
 
         self.backbone = timm.create_model(
@@ -277,8 +328,7 @@ class MultiScaleCBAMResNetRS(nn.Module):
         )
 
     def forward(self, x):
-        feats = self.backbone(x)
-        x2, x3, x4 = feats
+        x2, x3, x4 = self.backbone(x)
 
         f2 = self.pool2(self.cbam2(x2)).flatten(1)
         f3 = self.pool3(self.cbam3(x3)).flatten(1)
@@ -292,22 +342,25 @@ class MultiScaleCBAMResNetRS(nn.Module):
 # CutMix / MixUp utilities
 # ============================================================
 def rand_bbox(size, lam):
-    H, W = size[2], size[3]
-    cut_rat = (1.0 - lam) ** 0.5
-    cut_h = int(H * cut_rat)
-    cut_w = int(W * cut_rat)
+    """Generate a random bounding box for CutMix."""
+    height, width = size[2], size[3]
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_h = int(height * cut_ratio)
+    cut_w = int(width * cut_ratio)
 
-    cy = torch.randint(0, H, (1,)).item()
-    cx = torch.randint(0, W, (1,)).item()
+    center_y = torch.randint(0, height, (1,)).item()
+    center_x = torch.randint(0, width, (1,)).item()
 
-    y1 = max(cy - cut_h // 2, 0)
-    y2 = min(cy + cut_h // 2, H)
-    x1 = max(cx - cut_w // 2, 0)
-    x2 = min(cx + cut_w // 2, W)
+    y1 = max(center_y - cut_h // 2, 0)
+    y2 = min(center_y + cut_h // 2, height)
+    x1 = max(center_x - cut_w // 2, 0)
+    x2 = min(center_x + cut_w // 2, width)
     return y1, y2, x1, x2
 
 
+
 def cutmix_data(images, targets, alpha=1.0):
+    """Apply CutMix augmentation to a batch."""
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
     batch_size = images.size(0)
     index = torch.randperm(batch_size, device=images.device)
@@ -320,17 +373,20 @@ def cutmix_data(images, targets, alpha=1.0):
     return mixed_images, targets, targets[index], lam
 
 
+
 def mixup_data(images, targets, alpha=0.4):
+    """Apply MixUp augmentation to a batch."""
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
     index = torch.randperm(images.size(0), device=images.device)
-    mixed = lam * images + (1 - lam) * images[index]
-    return mixed, targets, targets[index], lam
+    mixed_images = lam * images + (1 - lam) * images[index]
+    return mixed_images, targets, targets[index], lam
 
 
 # ============================================================
 # Logging / Curves
 # ============================================================
 def save_loss_curve(train_losses, val_losses, save_dir):
+    """Save training and validation loss curve."""
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -353,7 +409,9 @@ def save_loss_curve(train_losses, val_losses, save_dir):
     print(f"Loss curve saved to {loss_curve_path}")
 
 
+
 def save_accuracy_curve(train_accs, val_accs, save_dir):
+    """Save training and validation accuracy curve."""
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -376,22 +434,28 @@ def save_accuracy_curve(train_accs, val_accs, save_dir):
     print(f"Accuracy curve saved to {acc_curve_path}")
 
 
+
 def save_training_log(train_losses, val_losses, train_accs, val_accs, save_dir):
+    """Save per-epoch metrics into a CSV file."""
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = save_dir / "training_log.csv"
-    with open(log_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss", "train_acc", "val_acc"])
-        for i in range(len(train_losses)):
-            writer.writerow([
-                i + 1,
-                train_losses[i],
-                val_losses[i],
-                train_accs[i],
-                val_accs[i],
-            ])
+    with open(log_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            ["epoch", "train_loss", "val_loss", "train_acc", "val_acc"]
+        )
+        for idx in range(len(train_losses)):
+            writer.writerow(
+                [
+                    idx + 1,
+                    train_losses[idx],
+                    val_losses[idx],
+                    train_accs[idx],
+                    val_accs[idx],
+                ]
+            )
 
     print(f"Training log saved to {log_path}")
 
@@ -400,6 +464,7 @@ def save_training_log(train_losses, val_losses, train_accs, val_accs, save_dir):
 # Training
 # ============================================================
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
+    """Run one training epoch."""
     model.train()
     running_loss = 0.0
     correct = 0
@@ -407,17 +472,30 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 
     pbar = tqdm(loader, desc=f"Train Epoch {epoch}")
     for images, targets in pbar:
-        images, targets = images.to(device), targets.to(device)
+        images = images.to(device)
+        targets = targets.to(device)
 
-        r = torch.rand(1).item()
-        if r < 0.4:
-            images_mixed, targets_a, targets_b, lam = cutmix_data(images, targets)
+        random_value = torch.rand(1).item()
+        if random_value < 0.4:
+            images_mixed, targets_a, targets_b, lam = cutmix_data(
+                images,
+                targets,
+            )
             outputs = model(images_mixed)
-            loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
-        elif r < 0.7:
-            images_mixed, targets_a, targets_b, lam = mixup_data(images, targets)
+            loss = (
+                lam * criterion(outputs, targets_a)
+                + (1 - lam) * criterion(outputs, targets_b)
+            )
+        elif random_value < 0.7:
+            images_mixed, targets_a, targets_b, lam = mixup_data(
+                images,
+                targets,
+            )
             outputs = model(images_mixed)
-            loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+            loss = (
+                lam * criterion(outputs, targets_a)
+                + (1 - lam) * criterion(outputs, targets_b)
+            )
         else:
             outputs = model(images)
             loss = criterion(outputs, targets)
@@ -428,11 +506,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
+        predicted = outputs.argmax(dim=1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100. * correct / total:.2f}%")
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            acc=f"{100.0 * correct / total:.2f}%",
+        )
 
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
@@ -441,18 +522,20 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
+    """Validate the model on the validation set."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
     for images, targets in tqdm(loader, desc="Validating"):
-        images, targets = images.to(device), targets.to(device)
+        images = images.to(device)
+        targets = targets.to(device)
         outputs = model(images)
         loss = criterion(outputs, targets)
 
         running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
+        predicted = outputs.argmax(dim=1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
@@ -461,7 +544,19 @@ def validate(model, loader, criterion, device):
     return val_loss, val_acc
 
 
+
+def build_model(num_classes, dropout, model_name):
+    """Build the default classification model."""
+    return MultiScaleCBAMResNetRS(
+        num_classes=num_classes,
+        dropout=dropout,
+        model_name=model_name,
+    )
+
+
+
 def train(args):
+    """Train the model and save checkpoints and curves."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -474,12 +569,16 @@ def train(args):
     num_classes = len(classes)
     print(f"Number of classes: {num_classes}")
 
-    model = MultiScaleCBAMResNetRS(
+    model = build_model(
         num_classes=num_classes,
         dropout=args.dropout,
         model_name=args.model_name,
     ).to(device)
-    # model = MultiScaleCBAMResNeXt(num_classes=num_classes, dropout=args.dropout).to(device)
+    # Alternative backbone:
+    # model = MultiScaleCBAMResNeXt(
+    #     num_classes=num_classes,
+    #     dropout=args.dropout,
+    # ).to(device)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
@@ -519,7 +618,12 @@ def train(args):
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         scheduler.step()
@@ -527,8 +631,8 @@ def train(args):
         lr_now = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch}/{args.epochs} | "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.2f}% | "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.2f}% | "
+            f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
+            f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}% | "
             f"LR: {lr_now:.6f}"
         )
 
@@ -542,22 +646,40 @@ def train(args):
             best_epoch = epoch
             patience_counter = 0
             torch.save(model.state_dict(), save_dir / "best_model.pth")
-            print(f"  -> New best model saved (epoch={best_epoch}, val acc={best_acc:.2f}%)")
+            print(
+                "  -> New best model saved "
+                f"(epoch={best_epoch}, val acc={best_acc:.2f}%)"
+            )
         else:
             patience_counter += 1
-            print(f"  -> No improvement. EarlyStop counter: {patience_counter}/{args.early_stop_patience}")
+            print(
+                "  -> No improvement. EarlyStop counter: "
+                f"{patience_counter}/{args.early_stop_patience}"
+            )
 
         torch.save(model.state_dict(), save_dir / "last_model.pth")
 
-        save_training_log(train_losses, val_losses, train_accs, val_accs, save_dir)
+        save_training_log(
+            train_losses,
+            val_losses,
+            train_accs,
+            val_accs,
+            save_dir,
+        )
         save_loss_curve(train_losses, val_losses, save_dir)
         save_accuracy_curve(train_accs, val_accs, save_dir)
 
         if patience_counter >= args.early_stop_patience:
-            print(f"\nEarly stopping triggered at epoch {epoch}. Best epoch: {best_epoch}, best val acc: {best_acc:.2f}%")
+            print(
+                f"\nEarly stopping triggered at epoch {epoch}. "
+                f"Best epoch: {best_epoch}, best val acc: {best_acc:.2f}%"
+            )
             break
 
-    print(f"\nTraining done. Best epoch: {best_epoch}, Best val acc: {best_acc:.2f}%")
+    print(
+        f"\nTraining done. Best epoch: {best_epoch}, "
+        f"Best val acc: {best_acc:.2f}%"
+    )
 
 
 # ============================================================
@@ -565,10 +687,11 @@ def train(args):
 # ============================================================
 @torch.no_grad()
 def inference(args):
+    """Run inference with test-time augmentation and save predictions."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    test_loader, classes = get_dataloaders(
+    _, classes = get_dataloaders(
         args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -576,40 +699,35 @@ def inference(args):
     )
     num_classes = len(classes)
 
-    model = MultiScaleCBAMResNetRS(
+    model = build_model(
         num_classes=num_classes,
         dropout=0.0,
         model_name=args.model_name,
     ).to(device)
+    # Alternative backbone:
     # model = MultiScaleCBAMResNeXt(num_classes=num_classes, dropout=0.0).to(device)
 
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.eval()
 
-    imagenet_mean = [0.485, 0.456, 0.406]
-    imagenet_std = [0.229, 0.224, 0.225]
-    image_size = 480
-
     tta_transforms = [
-        transforms.Compose([
-            transforms.Resize(int(image_size * 1.05), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        ]),
-        transforms.Compose([
-            transforms.Resize(int(image_size * 1.05), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.RandomHorizontalFlip(p=1.0),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        ]),
-        transforms.Compose([
-            transforms.Resize(int(image_size * 1.10), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        ]),
+        build_eval_transform(1.05),
+        transforms.Compose(
+            [
+                transforms.Resize(
+                    int(IMAGE_SIZE * 1.05),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
+                transforms.CenterCrop(IMAGE_SIZE),
+                transforms.RandomHorizontalFlip(p=1.0),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=IMAGENET_MEAN,
+                    std=IMAGENET_STD,
+                ),
+            ]
+        ),
+        build_eval_transform(1.10),
     ]
 
     test_root = os.path.join(args.data_root, "test")
@@ -622,8 +740,8 @@ def inference(args):
         img = Image.open(img_path).convert("RGB")
 
         logits_sum = None
-        for t in tta_transforms:
-            x = t(img).unsqueeze(0).to(device)
+        for transform in tta_transforms:
+            x = transform(img).unsqueeze(0).to(device)
             logits = model(x)
             logits_sum = logits if logits_sum is None else logits_sum + logits
 
@@ -631,11 +749,12 @@ def inference(args):
         pred_class = classes[pred_idx]
         predictions.append((os.path.splitext(img_name)[0], pred_class))
 
-    output_path = Path(args.save_dir) / "prediction.csv"
-    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "prediction.csv"
 
-    with open(output_path, "w", newline="") as f:
-        writer = csv.writer(f)
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
         writer.writerow(["image_name", "pred_label"])
         writer.writerows(predictions)
 
@@ -647,6 +766,7 @@ def inference(args):
 # ============================================================
 @torch.no_grad()
 def evaluate_and_save_confusion_matrix(args):
+    """Evaluate the model on validation data and save confusion matrix."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -658,11 +778,12 @@ def evaluate_and_save_confusion_matrix(args):
     )
     num_classes = len(classes)
 
-    model = MultiScaleCBAMResNetRS(
+    model = build_model(
         num_classes=num_classes,
         dropout=0.0,
         model_name=args.model_name,
     ).to(device)
+    # Alternative backbone:
     # model = MultiScaleCBAMResNeXt(num_classes=num_classes, dropout=0.0).to(device)
 
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
@@ -677,7 +798,8 @@ def evaluate_and_save_confusion_matrix(args):
     total = 0
 
     for images, targets in tqdm(val_loader, desc="Evaluating"):
-        images, targets = images.to(device), targets.to(device)
+        images = images.to(device)
+        targets = targets.to(device)
 
         outputs = model(images)
         loss = criterion(outputs, targets)
@@ -700,14 +822,18 @@ def evaluate_and_save_confusion_matrix(args):
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    cm = confusion_matrix(all_targets, all_preds, labels=list(range(num_classes)))
+    cm = confusion_matrix(
+        all_targets,
+        all_preds,
+        labels=list(range(num_classes)),
+    )
 
     cm_csv_path = save_dir / "confusion_matrix.csv"
-    with open(cm_csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["gt/pred"] + classes)
-        for i, row in enumerate(cm):
-            writer.writerow([classes[i]] + row.tolist())
+    with open(cm_csv_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["gt/pred", *classes])
+        for idx, row in enumerate(cm):
+            writer.writerow([classes[idx], *row.tolist()])
 
     fig_size = max(12, num_classes * 0.35)
     fig, ax = plt.subplots(figsize=(fig_size, fig_size))
@@ -724,7 +850,7 @@ def evaluate_and_save_confusion_matrix(args):
 
     cm_png_path = save_dir / "confusion_matrix.png"
     plt.savefig(cm_png_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    plt.close(fig)
 
     print(f"Confusion matrix csv saved to {cm_csv_path}")
     print(f"Confusion matrix image saved to {cm_png_path}")
@@ -733,12 +859,19 @@ def evaluate_and_save_confusion_matrix(args):
 # ============================================================
 # Main
 # ============================================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train, test, or evaluate the image classification model."
+    )
 
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
-    parser.add_argument("--checkpoint", type=str, default="./checkpoints/best_model.pth")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="./checkpoints/best_model.pth",
+    )
 
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=30)
@@ -753,10 +886,25 @@ if __name__ == "__main__":
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--early_stop_patience", type=int, default=20)
 
-    parser.add_argument("--model_name", type=str, default="resnetrs101.tf_in1k")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "test", "eval"])
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="resnetrs101.tf_in1k",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="train",
+        choices=["train", "test", "eval"],
+    )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+
+def main():
+    """Entry point."""
+    args = parse_args()
 
     if args.mode == "train":
         train(args)
@@ -764,3 +912,7 @@ if __name__ == "__main__":
         inference(args)
     else:
         evaluate_and_save_confusion_matrix(args)
+
+
+if __name__ == "__main__":
+    main()
