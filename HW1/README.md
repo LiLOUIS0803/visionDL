@@ -124,5 +124,5 @@ Evaluation outputs:
 
 
 ### Preformance Snapshot
-[Preformance Snapshot](HW1\snapshot.png)
+![Preformance Snapshot](HW1\snapshot.png)
 
