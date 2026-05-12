@@ -389,7 +389,7 @@ The output file follows COCO-style instance segmentation prediction format:
 - `--num_classes`: number of classes including background, default is `5`
 - `--detector`: detector type, choices are `cascade_mask_rcnn` and `mask_rcnn`
 - `--backbone`: backbone type, choices are `convnextv2_base` and `resnet50`
-- `--anchor_preset`: anchor configuration, choices are `youzhe`, `default`, `area_light`, and `area`
+- `--anchor_preset`: anchor configuration, choices are `default`, `area_light`, and `area`
 - `--drop_path_rate`: stochastic depth rate for ConvNeXtV2
 - `--rpn_nms_thresh`: NMS threshold used in the RPN
 
