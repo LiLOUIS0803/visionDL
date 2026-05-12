@@ -520,7 +520,7 @@ class CellDataset(Dataset):
 
 class ConvNeXtV2FPNBackbone(nn.Module):
     def __init__(self, model_name="convnextv2_base.fcmae_ft_in22k_in1k",
-                 drop_path_rate=0.1, freeze_stem=False):
+                 drop_path_rate=0.2, freeze_stem=False):
         super().__init__()
         if not _HAS_TIMM:
             raise RuntimeError("Please `pip install timm` to use ConvNeXt-V2 backbone.")
@@ -557,7 +557,7 @@ class CascadeRoIHeads(nn.Module):
                  bbox_reg_weights=((10., 10., 5., 5.),
                                    (20., 20., 10., 10.),
                                    (30., 30., 15., 15.)),
-                 stage_loss_weights=(1.0, 0.5, 0.25),
+                 stage_loss_weights=(1.0, 1.0, 0.75),
                  batch_size_per_image=512,
                  positive_fraction=0.25,
                  score_thresh=0.05,
@@ -877,7 +877,7 @@ class CascadeMaskRCNN(nn.Module):
                  rpn_anchor_generator, rpn_head=None,
                  rpn_pre_nms_top_n_train=2000, rpn_post_nms_top_n_train=1000,
                  rpn_pre_nms_top_n_test=1000, rpn_post_nms_top_n_test=1000,
-                 rpn_nms_thresh=0.45,
+                 rpn_nms_thresh=0.5,
                  rpn_fg_iou_thresh=0.7, rpn_bg_iou_thresh=0.3,
                  rpn_batch_size_per_image=256, rpn_positive_fraction=0.5,
                  rpn_score_thresh=0.0,
@@ -891,7 +891,7 @@ class CascadeMaskRCNN(nn.Module):
                  bbox_reg_weights=((10., 10., 5., 5.),
                                    (20., 20., 10., 10.),
                                    (30., 30., 15., 15.)),
-                 stage_loss_weights=(1.0, 0.5, 0.25)):
+                 stage_loss_weights=(1.0, 1.0, 0.75)):
         super().__init__()
         self.backbone = backbone
         out_channels = backbone.out_channels
@@ -916,7 +916,7 @@ class CascadeMaskRCNN(nn.Module):
         if box_roi_pool is None:
             box_roi_pool = MultiScaleRoIAlign(
                 featmap_names=["0", "1", "2", "3"],
-                output_size=7, sampling_ratio=2,
+                output_size=14, sampling_ratio=2,
             )
         resolution = box_roi_pool.output_size[0]
         box_heads = nn.ModuleList([
@@ -930,7 +930,7 @@ class CascadeMaskRCNN(nn.Module):
         if mask_roi_pool is None:
             mask_roi_pool = MultiScaleRoIAlign(
                 featmap_names=["0", "1", "2", "3"],
-                output_size=14, sampling_ratio=2,
+                output_size=28, sampling_ratio=2,
             )
         mask_layers = (256, 256, 256, 256)
         mask_dilation = 1
@@ -1009,8 +1009,6 @@ class CascadeMaskRCNN(nn.Module):
 
 
 def get_anchor_sizes(anchor_preset):
-    if anchor_preset == "youzhe":
-        return ((16,), (32,), (64,), (128,), (256,))
     if anchor_preset == "default":
         return ((4,), (8,), (16,), (32,), (64,))
     if anchor_preset == "area_light":
@@ -1021,10 +1019,8 @@ def get_anchor_sizes(anchor_preset):
 
 
 def get_anchor_ratios(anchor_preset):
-    if anchor_preset == "youzhe":
-        return ((1.0,),) * 5
     sizes = get_anchor_sizes(anchor_preset)
-    return ((0.5, 1.0, 2.0),) * len(sizes)
+    return ((1.0,),) * len(sizes)
 
 
 def build_model(num_classes=5,
@@ -1034,9 +1030,9 @@ def build_model(num_classes=5,
                 box_score_thresh=0.05,
                 box_nms_thresh=0.5,
                 detections_per_img=300,
-                anchor_preset="youzhe",
-                drop_path_rate=0.1,
-                rpn_nms_thresh=0.45,
+                anchor_preset="default",
+                drop_path_rate=0.2,
+                rpn_nms_thresh=0.5,
                 min_size=1024, max_size=1024):
     anchor_sizes = get_anchor_sizes(anchor_preset)
     anchor_ratios = get_anchor_ratios(anchor_preset)
@@ -1684,10 +1680,10 @@ def parse_args():
                    choices=["cascade_mask_rcnn", "mask_rcnn"])
     p.add_argument("--backbone", default="convnextv2_base",
                    choices=["convnextv2_base", "resnet50"])
-    p.add_argument("--anchor_preset", default="youzhe",
-                   choices=["youzhe", "default", "area_light", "area"])
-    p.add_argument("--drop_path_rate", type=float, default=0.1)
-    p.add_argument("--rpn_nms_thresh", type=float, default=0.45)
+    p.add_argument("--anchor_preset", default="area_light",
+                   choices=["default", "area_light", "area"])
+    p.add_argument("--drop_path_rate", type=float, default=0.2)
+    p.add_argument("--rpn_nms_thresh", type=float, default=0.5)
 
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=4)
