@@ -219,32 +219,11 @@ python main.py \
     --output_dir ./outputs_cascade \
     --detector cascade_mask_rcnn \
     --backbone convnextv2_base \
-    --anchor_preset youzhe \
-    --num_classes 5 \
-    --crop_size 1024 \
     --epochs 50 \
     --batch_size 4 \
-    --num_workers 4 \
-    --optimizer adamw \
-    --lr 2e-4 \
-    --weight_decay 0.05 \
-    --warmup_epochs 5 \
-    --val_interval 5 \
-    --grad_clip 1.0 \
-    --drop_path_rate 0.1 \
-    --rpn_nms_thresh 0.45 \
-    --box_nms_thresh 0.5 \
-    --mask_nms_thresh 0.5 \
-    --score_thresh 0.05 \
-    --mask_thresh 0.5 \
-    --max_per_img 300 \
     --use_random_crop \
     --use_random_resize \
-    --use_copy_paste \
-    --copy_paste_prob 0.5 \
-    --max_paste_objects 8 \
-    --use_albu \
-    --train_compute_cm
+    --use_copy_paste
 ```
 
 ### Faster Training Command
@@ -257,6 +236,8 @@ python main.py \
     --train_dir ./data/train \
     --ann_dir ./data/annotations \
     --output_dir ./outputs_cascade \
+    --detector cascade_mask_rcnn \
+    --backbone convnextv2_base \
     --epochs 50 \
     --batch_size 4 \
     --val_interval 10 \
@@ -519,53 +500,6 @@ These techniques are useful for dense medical cell segmentation because small ob
 
 ---
 
-
-## Example Commands
-
-### 1. Convert Dataset
-
-```bash
-python -c "from dataset import tif_to_coco; tif_to_coco('./data/train', './data/annotations/train.json')"
-```
-
-### 2. Train
-
-```bash
-python main.py --mode train \
-    --train_dir ./data/train \
-    --ann_dir ./data/annotations \
-    --output_dir ./outputs_cascade \
-    --epochs 50 \
-    --batch_size 4 \
-    --val_interval 5 \
-    --use_random_crop \
-    --use_random_resize \
-    --use_copy_paste \
-    --use_albu \
-    --train_compute_cm
-```
-
-### 3. Validate
-
-```bash
-python main.py --mode validate \
-    --train_dir ./data/train \
-    --ann_dir ./data/annotations \
-    --checkpoint ./outputs_cascade/best_ap50.pth \
-    --output_dir ./outputs_cascade
-```
-
-### 4. Inference
-
-```bash
-python main.py --mode inference \
-    --test_dir ./data/test \
-    --test_ids_json ./data/test_image_name_to_ids.json \
-    --checkpoint ./outputs_cascade/best_ap50.pth \
-    --output_dir ./outputs_cascade
-```
-
----
 
 ## Acknowledgement
 
