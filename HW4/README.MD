@@ -1,0 +1,464 @@
+````markdown
+# PromptIR-NAF for Rain and Snow Image Restoration
+
+**Student ID:** 314551148  
+**Name:** 李秉倫  
+
+## Introduction
+
+This project implements an image restoration pipeline for **Visual Recognition using Deep Learning HW4**.  
+The goal is to restore clean RGB images from degraded images containing either **rain** or **snow** artifacts.
+
+The task is evaluated using **PSNR (Peak Signal-to-Noise Ratio)**. Therefore, the model must produce outputs that are numerically close to the clean target images, not only visually pleasing.
+
+The final method is based on **PromptIR**, but the internal restoration block is modified.  
+Instead of using the original Restormer-style `MDTA + GDFN` Transformer block, this implementation replaces it with a **NAFBlock-inspired restoration block**. This keeps the PromptIR encoder-decoder structure and prompt generation mechanism while making the model more suitable for low-level image restoration.
+
+Main features:
+
+- PromptIR-style encoder-decoder restoration framework
+- NAFBlock-inspired replacement for the original Transformer block
+- Prompt generation modules preserved from PromptIR
+- Residual image prediction
+- Rain and snow restoration in a single model
+- Training from scratch without pretrained weights
+- Paired random crop, flip, and rotation augmentation
+- Optional residual augmentation
+- Repeat-factor sampling for more diverse crop locations
+- Exponential Moving Average (EMA)
+- Mixed precision training
+- 8-way test-time augmentation (TTA)
+- Automatic export of:
+  - checkpoints
+  - training logs
+  - loss curves
+  - validation PSNR curves
+  - rain/snow PSNR curves
+  - `pred.npz`
+  - `prediction.zip`
+
+---
+
+## Project Structure
+
+A typical project layout is expected to look like this:
+
+```text
+PROJECT_ROOT/
+├── hw4_promptir_naf_full.py
+├── run_promptir_naf_train.sh
+├── run_promptir_naf_infer.sh
+├── README.md
+├── data/
+│   ├── train/
+│   │   ├── degraded/
+│   │   │   ├── rain-1.png
+│   │   │   ├── rain-2.png
+│   │   │   ├── ...
+│   │   │   ├── snow-1.png
+│   │   │   ├── snow-2.png
+│   │   │   └── ...
+│   │   └── clean/
+│   │       ├── rain_clean-1.png
+│   │       ├── rain_clean-2.png
+│   │       ├── ...
+│   │       ├── snow_clean-1.png
+│   │       ├── snow_clean-2.png
+│   │       └── ...
+│   └── test/
+│       └── degraded/
+│           ├── 0.png
+│           ├── 1.png
+│           ├── ...
+│           └── 99.png
+├── runs/
+│   └── promptir_naf_dim64/
+│       ├── best.pth
+│       ├── last.pth
+│       ├── train_log.csv
+│       ├── loss_curve.png
+│       ├── psnr_curve.png
+│       ├── type_psnr_curve.png
+│       └── visuals/
+│           └── epoch_xxx.png
+└── submission_promptir_naf_dim64/
+    ├── pred.npz
+    └── prediction.zip
+````
+
+---
+
+## Dataset Format
+
+The dataset should contain paired degraded and clean images.
+
+### Training Data
+
+The training folder should follow this structure:
+
+```text
+train/
+├── degraded/
+│   ├── rain-1.png
+│   ├── rain-2.png
+│   ├── ...
+│   ├── snow-1.png
+│   ├── snow-2.png
+│   └── ...
+└── clean/
+    ├── rain_clean-1.png
+    ├── rain_clean-2.png
+    ├── ...
+    ├── snow_clean-1.png
+    ├── snow_clean-2.png
+    └── ...
+```
+
+Each degraded image has a corresponding clean image:
+
+```text
+rain-1.png  -> rain_clean-1.png
+snow-1.png  -> snow_clean-1.png
+```
+
+### Test Data
+
+The test images are stored as:
+
+```text
+test/
+└── degraded/
+    ├── 0.png
+    ├── 1.png
+    ├── ...
+    └── 99.png
+```
+
+The test filenames do not indicate whether the image is degraded by rain or snow.
+Therefore, the model must restore both degradation types using a single model.
+
+---
+
+## Environment Setup
+
+### 1. Create a Python environment
+
+Python **3.9+** is recommended.
+
+```bash
+conda create -n hw4_restoration python=3.10 -y
+conda activate hw4_restoration
+```
+
+Or use `venv`:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
+On Windows:
+
+```bash
+python -m venv venv
+venv\Scripts\activate
+```
+
+---
+
+### 2. Install dependencies
+
+```bash
+pip install torch torchvision
+pip install numpy pillow matplotlib tqdm
+```
+
+If you use CUDA, install the PyTorch version that matches your CUDA environment.
+
+Please do not randomly install multiple incompatible CUDA builds and hope one of them magically works. That usually creates dependency soup.
+
+---
+
+## Usage
+
+The main script supports two modes:
+
+* `--mode train`: train the model
+* `--mode infer`: run inference and generate submission files
+
+---
+
+## Training
+
+### Stage A: Main Training with Charbonnier Loss
+
+Recommended training command:
+
+```bash
+python hw4_promptir_naf_full.py \
+  --mode train \
+  --data_root ./data \
+  --save_dir runs/promptir_naf_dim64 \
+  --epochs 400 \
+  --dim 64 \
+  --num_blocks 4,6,8,10 \
+  --num_refine 6 \
+  --patch_size 128 \
+  --batch_size 4 \
+  --repeat_factor 2 \
+  --lr 2e-4 \
+  --loss_type charbonnier \
+  --edge_loss_weight 0.0 \
+  --rain_loss_weight 1.0 \
+  --snow_loss_weight 1.0 \
+  --residual_aug_prob 0.03 \
+  --ema_decay 0.999 \
+  --num_workers 0 \
+  --amp \
+  --val_every 2
+```
+
+If your system supports multiprocessing dataloading, you may increase:
+
+```bash
+--num_workers 2
+```
+
+If you encounter `ValueError: too many fds`, use:
+
+```bash
+--num_workers 0
+```
+
+This error is caused by dataloader file descriptor limits, not by the model itself.
+
+---
+
+## Stage B: PSNR Fine-tuning
+
+After Stage A finishes, fine-tune from the best EMA checkpoint using PSNR loss:
+
+```bash
+python hw4_promptir_naf_full.py \
+  --mode train \
+  --data_root ./data \
+  --resume runs/promptir_naf_dim64/best.pth \
+  --resume_use_ema \
+  --save_dir runs/promptir_naf_dim64_psnr_ft \
+  --epochs 80 \
+  --dim 64 \
+  --num_blocks 4,6,8,10 \
+  --num_refine 6 \
+  --patch_size 128 \
+  --batch_size 4 \
+  --repeat_factor 2 \
+  --lr 5e-5 \
+  --loss_type psnr \
+  --edge_loss_weight 0.0 \
+  --rain_loss_weight 1.0 \
+  --snow_loss_weight 1.0 \
+  --residual_aug_prob 0.0 \
+  --ema_decay 0.9995 \
+  --num_workers 0 \
+  --amp \
+  --val_every 2
+```
+
+Residual augmentation is disabled in Stage B because this stage is designed to align the model more closely with the PSNR metric and the real validation/test distribution.
+
+---
+
+## Inference
+
+Run inference with EMA and 8-way TTA:
+
+```bash
+python hw4_promptir_naf_full.py \
+  --mode infer \
+  --data_root ./data \
+  --ckpt runs/promptir_naf_dim64_psnr_ft/best.pth \
+  --out_dir submission_promptir_naf_dim64_psnr_ft \
+  --use_ema \
+  --tta
+```
+
+If you want to infer from the Stage A checkpoint instead:
+
+```bash
+python hw4_promptir_naf_full.py \
+  --mode infer \
+  --data_root ./data \
+  --ckpt runs/promptir_naf_dim64/best.pth \
+  --out_dir submission_promptir_naf_dim64 \
+  --use_ema \
+  --tta
+```
+
+The inference output will be saved as:
+
+```text
+submission_promptir_naf_dim64_psnr_ft/
+├── pred.npz
+└── prediction.zip
+```
+
+The `prediction.zip` file is the file to upload to the competition system.
+
+---
+
+## Inference Output Format
+
+The submission file contains `pred.npz`.
+
+Inside `pred.npz`, each key is the original test filename:
+
+```text
+0.png
+1.png
+...
+99.png
+```
+
+Each value is a restored RGB image stored as a NumPy array with shape:
+
+```text
+(3, H, W)
+```
+
+The image values are stored as `uint8` in the range `0-255`.
+
+---
+
+## Main Arguments
+
+### Dataset
+
+* `--data_root`: path to the dataset root folder
+* `--save_dir`: directory for checkpoints, logs, curves, and visualizations
+* `--out_dir`: directory for inference outputs
+* `--ckpt`: checkpoint path used for inference
+* `--resume`: checkpoint path used for continuing training
+
+### Model
+
+* `--dim`: base channel dimension of the model
+* `--num_blocks`: number of blocks at each encoder/decoder level
+* `--num_refine`: number of refinement blocks
+* `--prompt_len`: number of learnable prompt components
+
+### Training
+
+* `--epochs`: number of training epochs
+* `--batch_size`: batch size
+* `--patch_size`: training patch size
+* `--repeat_factor`: number of repeated random crops per image per epoch
+* `--num_workers`: number of dataloader workers
+* `--lr`: learning rate
+* `--weight_decay`: weight decay for AdamW
+* `--loss_type`: loss function, choices include `charbonnier`, `mse`, `l1`, and `psnr`
+* `--edge_loss_weight`: weight of Sobel edge loss
+* `--rain_loss_weight`: loss weight for rain images
+* `--snow_loss_weight`: loss weight for snow images
+* `--residual_aug_prob`: probability of residual augmentation
+* `--ema_decay`: EMA decay value
+* `--amp`: enable mixed precision training
+* `--val_every`: validation frequency
+
+### Inference
+
+* `--use_ema`: use EMA weights from checkpoint
+* `--tta`: enable 8-way test-time augmentation
+
+---
+
+## Output Files
+
+During training, the following files are generated in `save_dir`:
+
+```text
+best.pth
+last.pth
+train_log.csv
+loss_curve.png
+psnr_curve.png
+type_psnr_curve.png
+visuals/
+```
+
+Descriptions:
+
+* `best.pth`
+  Best checkpoint selected by validation PSNR.
+
+* `last.pth`
+  Latest checkpoint.
+
+* `train_log.csv`
+  Training log containing epoch, training loss, validation PSNR, rain PSNR, snow PSNR, and learning rate.
+
+* `loss_curve.png`
+  Training loss curve.
+
+* `psnr_curve.png`
+  Overall validation PSNR curve.
+
+* `type_psnr_curve.png`
+  Separate validation PSNR curves for rain and snow images.
+
+* `visuals/`
+  Qualitative restoration examples saved during training.
+
+During inference, the following files are generated in `out_dir`:
+
+```text
+pred.npz
+prediction.zip
+```
+
+---
+
+## Method Summary
+
+This implementation uses several strategies to improve restoration quality:
+
+* **PromptIR framework** for all-in-one image restoration
+* **NAFBlock-style restoration block** instead of the original attention-heavy block
+* **Multi-scale encoder-decoder architecture**
+* **Prompt generation modules** for degradation-adaptive restoration
+* **Residual learning** for easier clean image reconstruction
+* **Patch-based training** for memory efficiency and data diversity
+* **Repeat-factor sampling** to increase random crop coverage
+* **Residual augmentation** to simulate additional degradation patterns
+* **Charbonnier loss** for stable main training
+* **PSNR loss fine-tuning** for metric alignment
+* **EMA weights** for more stable inference
+* **8-way TTA** for improved prediction robustness
+
+The main architectural change is replacing the original PromptIR `MDTA + GDFN` block with a simpler NAFBlock-inspired module. This improves restoration performance while keeping the model within the single-model PromptIR requirement.
+
+---
+
+## Performance Snapshot
+
+![Performance Snapshot](snapshot.png)
+
+---
+
+## Notes
+
+* Do not submit dataset files or model checkpoints to E3.
+* The E3 submission should include source code and the PDF report.
+* The competition submission should contain a zip file with `pred.npz` inside.
+* If `num_workers > 0` causes file descriptor errors, use `--num_workers 0`.
+* Do not resume the NAFBlock model from the original PromptIR baseline checkpoint, because the architecture is different.
+
+---
+
+## Acknowledgement
+
+This project is implemented in **PyTorch**.
+
+The method is based on **PromptIR** for all-in-one image restoration and uses a **NAFBlock-inspired** restoration block design. The implementation also refers to common image restoration practices such as residual prediction, EMA, PSNR-oriented fine-tuning, and test-time augmentation.
+
+```
+```
