@@ -45,7 +45,7 @@ A typical project layout is expected to look like this:
 
 ```text
 PROJECT_ROOT/
-├── hw4_promptir_naf_full.py
+├── main.py
 ├── run_promptir_naf_train.sh
 ├── run_promptir_naf_infer.sh
 ├── README.md
@@ -195,7 +195,7 @@ The main script supports two modes:
 Recommended training command:
 
 ```bash
-python hw4_promptir_naf_full.py \
+python main.py \
   --mode train \
   --data_root ./data \
   --save_dir runs/promptir_naf_dim64 \
@@ -239,7 +239,7 @@ This error is caused by dataloader file descriptor limits, not by the model itse
 After Stage A finishes, fine-tune from the best EMA checkpoint using PSNR loss:
 
 ```bash
-python hw4_promptir_naf_full.py \
+python main.py \
   --mode train \
   --data_root ./data \
   --resume runs/promptir_naf_dim64/best.pth \
@@ -273,7 +273,7 @@ Residual augmentation is disabled in Stage B because this stage is designed to a
 Run inference with EMA and 8-way TTA:
 
 ```bash
-python hw4_promptir_naf_full.py \
+python main.py \
   --mode infer \
   --data_root ./data \
   --ckpt runs/promptir_naf_dim64_psnr_ft/best.pth \
@@ -285,7 +285,7 @@ python hw4_promptir_naf_full.py \
 If you want to infer from the Stage A checkpoint instead:
 
 ```bash
-python hw4_promptir_naf_full.py \
+python main.py \
   --mode infer \
   --data_root ./data \
   --ckpt runs/promptir_naf_dim64/best.pth \
